@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+Interactive Game for AiNex Humanoid Robot
+Complete final version with camera and actions working properly
+"""
+
+import cv2
+import numpy as np
+import sys
+import time
+import sqlite3
+import subprocess
+import threading
+from pathlib import Path
+
+# Add Board SDK path
+sys.path.insert(0, '/home/ubuntu/software/ainex_controller')
+from ros_robot_controller_sdk import Board
+from ainex_kinematics.motion_manager import MotionManager
+import rospy
+
+# Initialize board
+rospy.init_node("interactive_game", anonymous=True)
+motion_manager = MotionManager()
+board = Board()
+
+# Configuration
+ACTION_PATH = Path('/home/ubuntu/software/ainex_controller/ActionGroups')
+COOLDOWN_SECONDS = 5
+CONFIRMATION_TIME = 1.0  # 1 second confirmation
+COLOR_THRESHOLD = 0.15  # 15% density threshold
+
+# State variables
+last_action_time = 0
+is_action_running = False
+action_thread_obj = None
+confirmed_side_memory = None  # Remember which side had the square
+square_was_removed = False    # Track if square was removed after detection
+
+# ROI definitions (x, y, width, height)
+LEFT_ROI = (50, 200, 150, 150)
+RIGHT_ROI = (440, 200, 150, 150)
+
+# HSV color ranges
+COLOR_RANGES = {
+    'red': [
+        (np.array([0, 100, 100]), np.array([10, 255, 255])),
+        (np.array([160, 100, 100]), np.array([180, 255, 255]))
+    ],
+    'green': [(np.array([40, 50, 50]), np.array([90, 255, 255]))],
+    'blue': [(np.array([100, 100, 100]), np.array([130, 255, 255]))],
+    'yellow': [(np.array([20, 100, 100]), np.array([35, 255, 255]))]
+}
+
+def release_camera():
+    """Kill processes that might be using the camera"""
+    try:
+        subprocess.run(['sudo', 'pkill', '-9', 'usb_cam_node'], 
+                      stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        
+        # Find and kill processes using /dev/video0
+        result = subprocess.run(['sudo', 'lsof', '/dev/video0'], 
+                               capture_output=True, text=True)
+        if result.stdout:
+            for line in result.stdout.split('\n')[1:]:
+                if line.strip():
+                    parts = line.split()
+                    if len(parts) > 1:
+                        pid = parts[1]
+                        subprocess.run(['sudo', 'kill', '-9', pid], 
+                                     stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"Error releasing camera: {e}")
+
+def move_head_to_look_down():
+    """Move head to look down position (from combination/climb_stairs reference)"""
+    try:
+        # Head servo positions from ainex_example scripts
+        # Head Pan (servo 23): 500 (center)
+        # Head Tilt (servo 24): 300 (looking down at table - from kick_ball)
+        print("📷 Moving camera to look down position...")
+        board.bus_servo_set_position(1.0, [[23, 500], [24, 300]])
+        time.sleep(1.5)  # Wait for servos to reach position
+        print("✅ Camera positioned to look down")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not move camera: {e}")
+
+def initialize_camera():
+    """Initialize camera with multiple backend attempts"""
+    release_camera()
+    
+    backends = [
+        (cv2.CAP_V4L2, "V4L2"),
+        (cv2.CAP_ANY, "ANY"),
+        (cv2.CAP_GSTREAMER, "GSTREAMER")
+    ]
+    
+    for backend, name in backends:
+        try:
+            cap = cv2.VideoCapture(0, backend)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                
+                # Test read
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"✅ Camera initialized with {name} backend")
+                    return cap
+                cap.release()
+        except Exception as e:
+            print(f"❌ {name} backend failed: {e}")
+    
+    return None
+
+def get_color_density(frame, roi):
+    """Calculate color density in ROI using HSV masking"""
+    x, y, w, h = roi
+    roi_frame = frame[y:y+h, x:x+w]
+    hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
+    
+    total_pixels = w * h
+    detected_colors = {}
+    
+    for color_name, ranges in COLOR_RANGES.items():
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
+        
+        colored_pixels = cv2.countNonZero(mask)
+        density = colored_pixels / total_pixels
+        
+        if density > COLOR_THRESHOLD:
+            detected_colors[color_name] = density
+    
+    return detected_colors
+
+def play_action(action_name):
+    """Execute action using Board SDK directly"""
+    try:
+        print(f"🎬 Executing action: {action_name}")
+        action_file = ACTION_PATH / f"{action_name}.d6a"
+        if not action_file.exists():
+            print(f"❌ Action file not found: {action_file}")
+            return False
+        print(f"🔍 Loading: {action_file}")
+        db = sqlite3.connect(str(action_file))
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM ActionGroup ORDER BY \"Index\"")
+        frames = cursor.fetchall()
+        db.close()
+        if not frames:
+            print(f"❌ No frames found")
+            return False
+        print(f"📊 Executing {len(frames)} frames")
+        for frame in frames:
+            frame_time = frame[1]
+            servo_commands = []
+            for i in range(22):
+                servo_id = i + 1
+                position = frame[2 + i]
+                if 500 <= position <= 2500:
+                    servo_commands.append([servo_id, position])
+            if servo_commands:
+                board.bus_servo_set_position(frame_time / 1000.0, servo_commands)
+                time.sleep(frame_time / 1000.0)
+        print(f"✅ Action completed: {action_name}")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"❌ Error: {e}")
+        traceback.print_exc()
+        return False
+
+
+def speak(text):
+    """Text to speech"""
+    try:
+        subprocess.run(['espeak', text], stderr=subprocess.DEVNULL)
+    except:
+        pass
+
+def action_thread(action_name, speech_text):
+    """Execute action in separate thread"""
+    global is_action_running, last_action_time
+    
+    speak(speech_text)
+    time.sleep(0.5)
+    
+    # Set to stand_low pose
+    try:
+        print("🤖 Setting pose: stand_low")
+        # motion_manager.run_action('stand_low')  # Uncomment when motion_manager available
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"⚠️  Could not set pose: {e}")
+    
+    # Look down before action
+    print("📷 Looking down at table")
+    board.bus_servo_set_position(0.5, [[23, 500], [24, 300]])
+    time.sleep(0.5)
+    
+    
+    play_action(action_name)
+    
+    is_action_running = False
+    last_action_time = time.time()
+
+def draw_ui(frame, left_colors, right_colors, status_text, cooldown_remaining=0):
+    """Draw UI elements on frame"""
+    # Draw ROI rectangles
+    for roi, colors in [(LEFT_ROI, left_colors), (RIGHT_ROI, right_colors)]:
+        x, y, w, h = roi
+        color = (0, 255, 0) if colors else (0, 0, 255)
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        
+        # Draw detected colors
+        if colors:
+            text_y = y + 20
+            for color_name, density in colors.items():
+                text = f"{color_name}: {density:.0%}"
+                cv2.putText(frame, text, (x+5, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                text_y += 20
+    
+    # Draw status
+    cv2.putText(frame, status_text, (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    # Draw cooldown
+    if cooldown_remaining > 0:
+        cooldown_text = f"Cooldown: {cooldown_remaining:.1f}s"
+        cv2.putText(frame, cooldown_text, (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    
+    return frame
+
+def main():
+    global is_action_running, last_action_time, action_thread_obj
+    
+    print("=" * 50)
+    print("🎮 AINEX INTERACTIVE GAME")
+    print("=" * 50)
+    print("Place ONE colored square in LEFT or RIGHT zone")
+    print("Robot will pick it up after 1-second confirmation")
+    print("Controls: Q=Quit, R=Reset")
+    print("=" * 50)
+    
+    # Move head to look down
+    move_head_to_look_down()
+    
+    # Initialize camera
+    cap = initialize_camera()
+    if cap is None:
+        print("❌ Failed to initialize camera!")
+        return
+    
+    try:
+        confirmation_start = None
+        confirmed_side = None
+        confirmed_side_memory = None
+        square_was_removed = False
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Failed to read frame")
+                break
+            
+            # Detect colors
+            left_colors = get_color_density(frame, LEFT_ROI)
+            right_colors = get_color_density(frame, RIGHT_ROI)
+            
+            left_has_object = len(left_colors) > 0
+            right_has_object = len(right_colors) > 0
+            
+            # Calculate cooldown
+            current_time = time.time()
+            cooldown_remaining = max(0, COOLDOWN_SECONDS - (current_time - last_action_time))
+            
+            # State machine
+            status_text = "Ready"
+            
+            if is_action_running:
+                status_text = "⚙️  Action Running..."
+                confirmation_start = None
+                confirmed_side = None
+                
+            elif cooldown_remaining > 0:
+                status_text = f"⏳ Cooldown..."
+                confirmation_start = None
+                confirmed_side = None
+                
+            else:
+                # Check for exactly one object
+                if left_has_object and not right_has_object:
+                    current_side = 'left'
+                elif right_has_object and not left_has_object:
+                    current_side = 'right'
+                else:
+                    # No object or multiple objects
+                    confirmation_start = None
+                    confirmed_side = None
+                    
+                    if not left_has_object and not right_has_object:
+                        status_text = "⚠️  Place ONE colored square"
+                    else:
+                        status_text = "⚠️  Remove extra objects!"
+                    
+                    current_side = None
+                
+                # Handle confirmation
+                if current_side:
+                    if confirmed_side != current_side:
+                        # New object detected
+                        confirmation_start = current_time
+                        confirmed_side = current_side
+                        confirmed_side_memory = current_side
+                        square_was_removed = False
+                        status_text = f"🔍 Confirming {current_side.upper()}..."
+                    else:
+                        # Same object, check confirmation time
+                        elapsed = current_time - confirmation_start
+                        remaining = CONFIRMATION_TIME - elapsed
+                        
+                        if remaining > 0:
+                            status_text = f"⏱️  Confirming: {remaining:.1f}s"
+                        else:
+                            # Confirmed! Wait for square to be removed
+                            status_text = "✋ Remove the square to trigger action"
+                            confirmed_side_memory = confirmed_side
+                
+                # Check if square was removed after confirmation
+                if confirmed_side_memory and not current_side:
+                    if not square_was_removed:
+                        square_was_removed = True
+                        
+                        # NEW LOGIC: If RIGHT square removed, use lefthand_place_square
+                        if confirmed_side_memory == "right":
+                            action_name = "lefthand_place_square"
+                            speech = "Right square removed, placing with left hand"
+                        else:
+                            action_name = "righthand_place_square"
+                            speech = "Left square removed, placing with right hand"
+                        
+                        is_action_running = True
+                        action_thread_obj = threading.Thread(
+                            target=action_thread,
+                            args=(action_name, speech)
+                        )
+                        action_thread_obj.start()
+                        
+                        confirmation_start = None
+                        confirmed_side = None
+                        confirmed_side_memory = None
+                # Handle confirmation
+                if current_side:
+                    if confirmed_side != current_side:
+                        # New object detected
+                        confirmation_start = current_time
+                        confirmed_side = current_side
+                        status_text = f"🔍 Confirming {current_side.upper()}..."
+                    else:
+                        # Same object, check confirmation time
+                        elapsed = current_time - confirmation_start
+                        remaining = CONFIRMATION_TIME - elapsed
+                        
+                        if remaining > 0:
+                            status_text = f"⏱️  Confirming: {remaining:.1f}s"
+                        else:
+                            # Confirmed! Execute action
+                            action_map = {
+                                'left': ('lefthand_place_square', 'Picking left'),
+                                'right': ('righthand_place_square', 'Picking right')
+                            }
+                            
+                            action_name, speech = action_map[confirmed_side]
+                            
+                            is_action_running = True
+                            action_thread_obj = threading.Thread(
+                                target=action_thread,
+                                args=(action_name, speech)
+                            )
+                            action_thread_obj.start()
+                            
+                            confirmation_start = None
+                            confirmed_side = None
+            
+            # Draw UI
+            frame = draw_ui(frame, left_colors, right_colors, status_text, cooldown_remaining)
+            
+            cv2.imshow('AiNex Interactive Game', frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                last_action_time = 0
+                confirmation_start = None
+                confirmed_side = None
+    
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if action_thread_obj and action_thread_obj.is_alive():
+            action_thread_obj.join(timeout=2)
+        print("\n✅ Game ended cleanly")
+
+if __name__ == '__main__':
+    main()

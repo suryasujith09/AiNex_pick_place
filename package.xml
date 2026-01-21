@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>pick_place</name>
+  <version>1.0.0</version>
+  <description>Interactive game for AiNex robot - object detection and placement</description>
+  <maintainer email="user@ainex.com">AiNex User</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>ainex_kinematics</depend>
+  <depend>ros_robot_controller_sdk</depend>
+
+  <export>
+  </export>
+</package>
