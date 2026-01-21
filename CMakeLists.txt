@@ -9,7 +9,15 @@ find_package(catkin REQUIRED COMPONENTS
 
 catkin_package()
 
+# Install Python scripts
 catkin_install_python(PROGRAMS
+  scripts/interactive_game_final.py
   scripts/interactive_game.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Install launch files
+install(DIRECTORY launch/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+  FILES_MATCHING PATTERN "*.launch"
 )

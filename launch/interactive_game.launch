@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Interactive Pick & Place Game for AiNex Robot -->
+  
+  <arg name="debug" default="false" />
+  
+  <!-- Launch the interactive game node -->
+  <node name="interactive_game" pkg="pick_place" type="interactive_game_final.py" output="screen">
+    <param name="start" value="true" />
+  </node>
+  
+</launch>
